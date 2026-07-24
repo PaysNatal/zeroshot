@@ -129,6 +129,22 @@ enum Cmd {
         #[arg(long, default_value_t = 3600)]
         grace_secs: u64,
     },
+    /// Node-plane cache agent: the SOLE sweeper of a shared node-local cache dir (a DaemonSet hostPath
+    /// that many capsule pods read/write). Pods use the cache with NO ceiling and never sweep; this agent
+    /// owns the dir and periodically evicts it under the byte ceiling. Runs one per node.
+    CacheAgent {
+        /// The shared node-local cache dir (blocks/ + manifests/). The agent must OWN it so its evictions
+        /// can remove any pod's files regardless of the writer's uid.
+        #[arg(long)]
+        cache_dir: String,
+        /// Byte ceiling the agent holds the cache under. Size it below the device minus headroom for the
+        /// pods' in-flight writes.
+        #[arg(long)]
+        max_gb: f64,
+        /// Seconds between eviction passes.
+        #[arg(long, default_value_t = 10)]
+        interval_secs: u64,
+    },
 }
 
 fn load_known(state: &Option<PathBuf>) -> Result<ChunkIndex> {
@@ -307,7 +323,53 @@ fn main() -> Result<()> {
                 );
             }
         }
+        Cmd::CacheAgent {
+            cache_dir,
+            max_gb,
+            interval_secs,
+        } => run_cache_agent(&cache_dir, max_gb, interval_secs)?,
     }
+    Ok(())
+}
+
+/// The node-plane cache agent: the SOLE sweeper of a shared node-local cache dir. Pods read/write it with
+/// no ceiling and never sweep; this agent OWNS the dir (so its eviction can `remove_file` any pod's block
+/// regardless of the writer's uid) and holds it under the byte ceiling on an interval. Drains on
+/// SIGTERM/SIGINT. Buildable in the default feature set — it only touches a local dir.
+fn run_cache_agent(cache_dir: &str, max_gb: f64, interval_secs: u64) -> Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    let root = std::path::Path::new(cache_dir);
+    // The agent owns the dir; ensure both tiers exist so eviction has something to enumerate even before
+    // any pod has written.
+    std::fs::create_dir_all(root.join("blocks"))?;
+    std::fs::create_dir_all(root.join("manifests"))?;
+    let max_bytes = (max_gb * 1024.0 * 1024.0 * 1024.0) as u64;
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&shutdown))
+        .context("register SIGTERM")?;
+    signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&shutdown))
+        .context("register SIGINT")?;
+    eprintln!(
+        "[cache-agent] sole sweeper of {cache_dir}: ceiling {max_gb} GB, every {interval_secs}s \
+         (SIGTERM/SIGINT → drain)"
+    );
+    while !shutdown.load(Ordering::SeqCst) {
+        // Interruptible sleep so a signal is felt within ~200ms even mid-interval.
+        let ticks = (interval_secs * 5).max(1);
+        for _ in 0..ticks {
+            if shutdown.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        if shutdown.load(Ordering::SeqCst) {
+            break;
+        }
+        capsule_workspace_core::cache::evict_to_limit(root, max_bytes);
+    }
+    eprintln!("[cache-agent] shutdown");
     Ok(())
 }
 

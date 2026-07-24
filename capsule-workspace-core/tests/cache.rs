@@ -168,3 +168,180 @@ fn bounded_cache_evicts_and_stays_correct() {
         assert_eq!(&c.get_block(id).unwrap(), want, "block {id} lost");
     }
 }
+
+// ---- Layer 1: node-plane cache (sole-sweeper agent + pods that never sweep) --------------------------
+
+use capsule_workspace_core::cache::evict_to_limit;
+use std::path::PathBuf;
+
+fn block_file(cache_root: &Path, id: &str) -> PathBuf {
+    cache_root.join("blocks").join(id)
+}
+fn set_mtime_secs_ago(p: &Path, secs: u64) {
+    let t = std::time::SystemTime::now() - std::time::Duration::from_secs(secs);
+    std::fs::File::options()
+        .write(true)
+        .open(p)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(t))
+        .unwrap();
+}
+
+// A POD store (`for_pod`, max_bytes=None) must NEVER sweep — the node-agent is the sole sweeper, so a pod
+// can never cross-UID-evict another pod's blocks. Proof: write far past any ceiling and assert nothing was
+// evicted. A regression that made a pod sweep (e.g. someone routing it through `with_limit(Some(..))`)
+// would drop blocks here.
+#[test]
+fn a_pod_store_never_sweeps() {
+    let d = tempfile::tempdir().unwrap();
+    let cache_root = d.path().join("cache");
+    let c = CachedBlobStore::for_pod(
+        &cache_root,
+        Box::new(LocalBlobStore::new(d.path().join("durable")).unwrap()),
+        None, // no backstop → truly unbounded, so the ONLY thing that could shrink it is a sweep
+    )
+    .unwrap();
+    for i in 0..40u32 {
+        c.put_block(&format!("{:064x}", i), &vec![i as u8; 256 * 1024])
+            .unwrap();
+    }
+    let n = std::fs::read_dir(cache_root.join("blocks"))
+        .unwrap()
+        .flatten()
+        .filter(|e| !e.file_name().to_string_lossy().ends_with(".tmp"))
+        .count();
+    assert_eq!(
+        n, 40,
+        "a pod store must not evict — the agent is the sole sweeper"
+    );
+}
+
+// The agent's eviction path (`evict_to_limit`, called directly by the node-agent) holds the ceiling on a
+// dir a pod filled without sweeping. This is the other half of the split: pods fill, the agent bounds.
+#[test]
+fn evict_to_limit_holds_the_ceiling() {
+    let d = tempfile::tempdir().unwrap();
+    let cache_root = d.path().join("cache");
+    let store = LocalBlobStore::new(&cache_root).unwrap();
+    for i in 0..40u32 {
+        store
+            .put_block(&format!("{:064x}", i), &vec![i as u8; 256 * 1024])
+            .unwrap(); // 10 MiB
+    }
+    const LIMIT: u64 = 4 * 1024 * 1024;
+    evict_to_limit(&cache_root, LIMIT);
+    let used: u64 = std::fs::read_dir(cache_root.join("blocks"))
+        .unwrap()
+        .flatten()
+        .filter_map(|e| e.metadata().ok())
+        .map(|m| m.len())
+        .sum();
+    assert!(
+        used <= LIMIT,
+        "agent eviction must hold the ceiling: {used} > {LIMIT}"
+    );
+    assert!(used > 0, "must not evict everything");
+}
+
+// THE ECICTION-POLICY DECISION, pinned. The node cache is a READ cache (warm resume, shared base blocks),
+// so it must evict by READ recency, not write age — else the most-read, most-valuable blocks are evicted
+// first. A read through the store touches the cache entry; the agent's oldest-mtime eviction must then
+// spare it. Control proves the read is load-bearing: WITHOUT the read, the same block is the one evicted.
+#[test]
+fn a_read_saves_a_block_from_eviction_read_recency() {
+    let d = tempfile::tempdir().unwrap();
+    let (a, b) = ("a".repeat(64), "b".repeat(64));
+    let big = 256 * 1024usize;
+
+    // TREATMENT: read A → A becomes the most-recently-used → the ceiling-1 eviction must keep A, drop B.
+    {
+        let cache_root = d.path().join("treat");
+        let c = CachedBlobStore::for_pod(
+            &cache_root,
+            Box::new(LocalBlobStore::new(d.path().join("dur_t")).unwrap()),
+            None,
+        )
+        .unwrap();
+        c.put_block(&a, &vec![1u8; big]).unwrap();
+        c.put_block(&b, &vec![2u8; big]).unwrap();
+        // Age both, A older than B, so by WRITE age A would be evicted first.
+        set_mtime_secs_ago(&block_file(&cache_root, &a), 200);
+        set_mtime_secs_ago(&block_file(&cache_root, &b), 100);
+        // READ A — touch-on-hit must refresh A's mtime to now, making it newest.
+        assert_eq!(c.get_block(&a).unwrap(), vec![1u8; big]);
+        // Evict to a ceiling that holds ~one block.
+        evict_to_limit(&cache_root, (big as u64) + (big as u64) / 4);
+        assert!(
+            block_file(&cache_root, &a).exists(),
+            "the READ block must survive eviction"
+        );
+        assert!(
+            !block_file(&cache_root, &b).exists(),
+            "the un-read block must be evicted"
+        );
+    }
+
+    // CONTROL: no read of A → A stays oldest → A is the one evicted. Proves the read above did the work.
+    {
+        let cache_root = d.path().join("ctrl");
+        let c = CachedBlobStore::for_pod(
+            &cache_root,
+            Box::new(LocalBlobStore::new(d.path().join("dur_c")).unwrap()),
+            None,
+        )
+        .unwrap();
+        c.put_block(&a, &vec![1u8; big]).unwrap();
+        c.put_block(&b, &vec![2u8; big]).unwrap();
+        set_mtime_secs_ago(&block_file(&cache_root, &a), 200);
+        set_mtime_secs_ago(&block_file(&cache_root, &b), 100);
+        // no read
+        evict_to_limit(&cache_root, (big as u64) + (big as u64) / 4);
+        assert!(
+            !block_file(&cache_root, &a).exists(),
+            "without a read, the older block is evicted"
+        );
+        assert!(block_file(&cache_root, &b).exists());
+    }
+}
+
+// The pod-side device-fill backstop (for nodes without a dedicated cache partition): once the cache is
+// over the cap, cache writes are skipped so a crashed agent can't fill the device — while every block
+// stays durable and readable via the backing store.
+#[test]
+fn the_pod_backstop_caps_cache_growth() {
+    let d = tempfile::tempdir().unwrap();
+    let cache_root = d.path().join("cache");
+    const CAP: u64 = 2 * 1024 * 1024;
+    let c = CachedBlobStore::for_pod(
+        &cache_root,
+        Box::new(LocalBlobStore::new(d.path().join("durable")).unwrap()),
+        Some(CAP),
+    )
+    .unwrap();
+    let mut ids = Vec::new();
+    for i in 0..40u32 {
+        let id = format!("{:064x}", i);
+        c.put_block(&id, &vec![i as u8; 256 * 1024]).unwrap(); // 10 MiB written into a 2 MiB backstop
+        ids.push((id, i as u8));
+    }
+    let used: u64 = std::fs::read_dir(cache_root.join("blocks"))
+        .unwrap()
+        .flatten()
+        .filter_map(|e| e.metadata().ok())
+        .map(|m| m.len())
+        .sum();
+    // Amortised, so it overshoots by up to a check interval, but must stay bounded near the cap — NOT the
+    // full 10 MiB. (No sweep runs: a pod never sweeps; the backstop just stops populating.)
+    assert!(
+        used < 2 * CAP,
+        "backstop must bound cache growth near the cap: {used} vs cap {CAP}"
+    );
+    // Durability is unaffected — every block reads back from the backing store.
+    for (id, byte) in &ids {
+        assert_eq!(
+            c.get_block(id).unwrap(),
+            vec![*byte; 256 * 1024],
+            "block {id} must stay durable"
+        );
+    }
+}

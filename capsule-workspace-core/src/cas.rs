@@ -105,6 +105,19 @@ impl LocalBlobStore {
     fn manifest_path(&self, d: &str) -> PathBuf {
         self.root.join("manifests").join(d)
     }
+
+    /// Best-effort refresh of a cached object's mtime — **read-recency LRU for the cache tier**. The
+    /// node-agent evicts oldest-mtime, so unless a read marks the entry recent the most-READ blocks (the
+    /// shared base a warm resume depends on) are evicted first. Cross-UID at 0644 this fails (the entry
+    /// falls back to its write-age clock — degraded, never wrong); 0664 + a shared gid makes it work. The
+    /// caller swallows the error.
+    pub fn touch_block(&self, id: &str) -> Result<()> {
+        touch_mtime(&self.block_path(id))
+    }
+    /// Read-recency touch for a cached manifest; see [`LocalBlobStore::touch_block`].
+    pub fn touch_manifest(&self, digest: &str) -> Result<()> {
+        touch_mtime(&self.manifest_path(digest))
+    }
 }
 
 /// Refresh a content-addressed object's mtime to "now". Grace-period GC uses mtime as the liveness
