@@ -1531,3 +1531,49 @@ double cannot provide.
 122 tests green by default, 141 with `pg,s3`; clippy 0 on both feature sets; golden digest unchanged. This
 closes the last item the gate ruled worth code; remaining work (ranged reads, manifest compression, the
 held-hoist residency guard) is either feature work or needs fault injection — deferred debt, gate-ruled STOP.
+
+### 2026-07-24 — Layer 2: real-hardware perf (c7gd Graviton, XFS reflink NVMe) — node-plane campaign
+
+Measured on ONE c7gd.2xlarge (8 vCPU aarch64, instance-store NVMe formatted XFS reflink=1) in the internal
+account; all resources (instance, S3 bucket, IAM role+profile) TORN DOWN and verified gone. This closes the
+axes kind structurally cannot give: reflink on real NVMe, real S3, ARMv8 hardware SHA.
+
+**Reflink warm resume — the design's central premise, VALIDATED as a metadata operation.** `materialize
+--reference` reflinks unchanged files via FICLONE, and `filefrag` shows the output extents are `shared` with
+the reference (real CoW, not a copy) with reflink_secs=0.005 for 2 GB — extent-sharing is the robust,
+sample-independent proof that warm resume does NOT read/write the data. The single-run wall times illustrate
+the scale: 2 GB cold 2.07s vs warm 0.03s (~69x), two orders of magnitude, but the load-bearing claim is the
+shared-extent evidence, not that precise ratio.
+HONESTY NOTE: the FIRST run reported warm=5.18s (SLOWER than cold). That was a transient anomaly — the 2 GB
+`dd` fixture + the cold materialize had just written ~4 GB and writeback was still draining when the warm
+pass ran. A settled re-run (sync + drop_caches before each, fixture pre-generated) gives 0.03s, and the
+extent-sharing check proves the reflink itself is a metadata op. The 5.18s is recorded, not hidden; it is a
+measurement artifact, not the reflink path's cost.
+
+**Realistic lifecycle on Graviton (real NVMe, hardware SHA), DISTINCT-content fixtures:**
+
+- clone (4k-file repo): 0.116s, 8.3 MB upload
+- work (40 edits): 0.062s, 0.10 MB (incremental)
+- npm install (35k new files): 0.739s, 15.4 MB upload, 35k new chunks
+- idle (stat-skip over 39k files): 0.381s, 0 upload
+  All sub-second — the checkpoint axis is a non-issue for the real workload, and ~4x faster than the laptop
+  ESTIMATES (npm-install 0.74s vs 3.1s on the Mac), as expected for Graviton.
+  DO NOT read the harness's `hash_throughput_mbps` (355-662 here) as a SHA-256 rate — it is EFFECTIVE
+  WHOLE-PUBLISH throughput (walk+read+hash+zstd on small files), per-file-overhead bound, and it sits BELOW
+  `sha_backend.rs`'s 700 MB/s software floor, so it cannot be the hash loop. This is the exact mislabel O26
+  corrected for 344/1765 MB/s; not repeating it here. MISSED OPPORTUNITY: real Graviton was the chance to
+  isolate the ARMv8 hardware-SHA loop rate O26 flagged as never-measured (>2000 MiB/s on aarch64 dev
+  hardware) by running `tests/sha_backend.rs` on the instance — not done before teardown; still open.
+  A FIRST fixture bug was caught and fixed: the initial node_modules generator emitted near-identical
+  repetitive content, so 35k files deduped to 3 chunks (new_chunks=3) — a degenerate fixture that made the
+  upload number meaningless. Re-run with per-file-seeded distinct content gives the real 35k-chunk / 15.4 MB.
+
+**Real S3 (SDK via instance profile):** repo+nm publish 23.7 MB / 39k new chunks; S3 cold materialize of
+that manifest 0.35s. (The publish wall-time was NOT captured — a redirect bug in the harness. UNVERIFIED
+INFERENCE, not a measurement: by analogy to the 0.35s materialize of the same 23.7 MB it is likely
+sub-second, but publish also hashes+chunks+zstds and issues ~39k PUTs, so it is not symmetric with
+materialize and this was not measured. Instance torn down, so not re-run.)
+
+Caveats: single instance, one run per metric (not a distribution); one AZ; the cross-pod node-cache reflink
+SHARING (multiple pods on one node) was validated for LOGIC in kind but its multi-pod PERF was not measured
+here (single-process reflink was). Numbers are directional production figures, not a benchmark suite.
