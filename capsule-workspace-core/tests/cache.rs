@@ -371,3 +371,357 @@ fn touch_block_refreshes_mtime() {
         "touch_block must move mtime forward ({old:?} -> {new:?})"
     );
 }
+
+// Idea 3: manifest zstd at rest. Round-trips (put compresses, get decompresses), is digest-neutral
+// (the golden test proves that separately), and is back-compatible with raw pre-feature manifests.
+#[test]
+fn manifest_compression_roundtrips_and_is_backcompat() {
+    use capsule_workspace_core::cas::{compress_manifest, maybe_decompress_manifest};
+    let _g = env_guard();
+    std::env::set_var("CAPWS_MANIFEST_ZSTD", "1"); // opt-in (default off)
+    let d = tempfile::tempdir().unwrap();
+    let s = LocalBlobStore::new(d.path()).unwrap();
+    let raw = br#"{"files":[{"path":"a","chunks":["c1","c2"]}],"parent":null}"#.to_vec();
+
+    // put -> get returns byte-identical JSON, regardless of on-disk form.
+    s.put_manifest("deadbeef", &raw).unwrap();
+    assert_eq!(
+        s.get_manifest("deadbeef").unwrap(),
+        raw,
+        "manifest must round-trip through compression"
+    );
+
+    // the stored bytes are actually zstd (magic), not the raw JSON.
+    let stored = std::fs::read(d.path().join("manifests/deadbeef")).unwrap();
+    assert_eq!(
+        &stored[..4],
+        &[0x28, 0xB5, 0x2F, 0xFD],
+        "stored manifest must be zstd"
+    );
+    assert!(
+        stored.len() < raw.len() || raw.len() < 64,
+        "should compress (or be tiny)"
+    );
+
+    // back-compat: a RAW (uncompressed) manifest already on disk still loads (older stores).
+    std::fs::write(d.path().join("manifests/older"), &raw).unwrap();
+    assert_eq!(
+        s.get_manifest("older").unwrap(),
+        raw,
+        "must still read pre-compression raw manifests"
+    );
+
+    // the helpers are inverses, and the sniff never false-positives on JSON.
+    assert_eq!(maybe_decompress_manifest(compress_manifest(&raw)), raw);
+    assert_eq!(
+        maybe_decompress_manifest(raw.clone()),
+        raw,
+        "raw JSON passes through untouched"
+    );
+    std::env::remove_var("CAPWS_MANIFEST_ZSTD");
+}
+
+// Idea 2: ranged reads. Materialize with CAPWS_RANGED_READS=1 must produce byte-identical output to the
+// whole-block path, and reject a corrupted chunk (per-chunk hash verify is unchanged by ranging).
+#[test]
+fn ranged_reads_materialize_byte_identically() {
+    use capsule_workspace_core::daemon::publish;
+    let _g = env_guard();
+    let d = tempfile::tempdir().unwrap();
+    let tree = d.path().join("t");
+    // multi-block tree so ranges land at non-zero offsets inside blocks
+    for i in 0..30u32 {
+        write(
+            &tree.join(format!("f{i}.bin")),
+            &vec![(i as u8).wrapping_mul(7); 300_000],
+        );
+    }
+    let store_dir = d.path().join("s");
+    let s = LocalBlobStore::new(&store_dir).unwrap();
+    let m = publish(&tree, &s, &ChunkIndex::new(), None)
+        .unwrap()
+        .manifest;
+
+    // whole-block (default)
+    std::env::remove_var("CAPWS_RANGED_READS");
+    let out_whole = d.path().join("whole");
+    materialize(&LocalBlobStore::new(&store_dir).unwrap(), &m, &out_whole).unwrap();
+
+    // ranged
+    std::env::set_var("CAPWS_RANGED_READS", "1");
+    let out_ranged = d.path().join("ranged");
+    materialize(&LocalBlobStore::new(&store_dir).unwrap(), &m, &out_ranged).unwrap();
+    std::env::remove_var("CAPWS_RANGED_READS");
+
+    for i in 0..30u32 {
+        let want = vec![(i as u8).wrapping_mul(7); 300_000];
+        assert_eq!(
+            fs::read(out_whole.join(format!("f{i}.bin"))).unwrap(),
+            want,
+            "whole f{i}"
+        );
+        assert_eq!(
+            fs::read(out_ranged.join(format!("f{i}.bin"))).unwrap(),
+            want,
+            "ranged f{i} must match"
+        );
+    }
+}
+
+// Env-var-controlled features (ranged reads, dedup gate) are process-global; Rust runs tests in parallel
+// threads, so serialize the ones that toggle env vars behind this guard.
+fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+    static M: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    M.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+// Idea 1 (physical-block determinism): two INDEPENDENT streaming publishes of the same tree to DIFFERENT
+// stores must produce the SAME block ids. This is the canonical-packing property cross-capsule dedup rests
+// on — and the golden digest test CANNOT see it (it pins logical identity, which excludes packing).
+#[test]
+fn streaming_packing_is_canonical_across_stores() {
+    use capsule_workspace_core::daemon::publish;
+    let d = tempfile::tempdir().unwrap();
+    let tree = d.path().join("t");
+    for i in 0..20u32 {
+        write(&tree.join(format!("f{i}.bin")), &vec![i as u8; 300_000]);
+    }
+    let blocks = |sub: &str| -> std::collections::BTreeSet<String> {
+        let s = LocalBlobStore::new(d.path().join(sub)).unwrap();
+        publish(&tree, &s, &ChunkIndex::new(), None).unwrap();
+        std::fs::read_dir(d.path().join(sub).join("blocks"))
+            .unwrap()
+            .flatten()
+            .filter(|e| !e.file_name().to_string_lossy().ends_with(".tmp"))
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect()
+    };
+    assert_eq!(
+        blocks("a"),
+        blocks("b"),
+        "streaming publish must pack canonically (identical block ids)"
+    );
+}
+
+// Idea 1 (dedup gate): a second INDEPENDENT publish (fresh index) of the same tree to the same store, with
+// the gate on, must skip every upload — the blocks are already durable (canonical packing makes their ids
+// match) — while still producing a materializable manifest.
+#[test]
+fn dedup_gate_skips_already_durable_blocks() {
+    use capsule_workspace_core::daemon::publish;
+    let _g = env_guard();
+    let d = tempfile::tempdir().unwrap();
+    let tree = d.path().join("t");
+    for i in 0..20u32 {
+        write(&tree.join(format!("f{i}.bin")), &vec![i as u8; 300_000]);
+    }
+    let sdir = d.path().join("s");
+
+    std::env::remove_var("CAPWS_DEDUP_GATE");
+    let p1 = publish(
+        &tree,
+        &LocalBlobStore::new(&sdir).unwrap(),
+        &ChunkIndex::new(),
+        None,
+    )
+    .unwrap();
+    assert!(p1.blocks > 0);
+    assert_eq!(
+        p1.blocks_uploaded, p1.blocks,
+        "first publish uploads every block"
+    );
+
+    std::env::set_var("CAPWS_DEDUP_GATE", "1");
+    let p2 = publish(
+        &tree,
+        &LocalBlobStore::new(&sdir).unwrap(),
+        &ChunkIndex::new(),
+        None,
+    )
+    .unwrap();
+    std::env::remove_var("CAPWS_DEDUP_GATE");
+    assert_eq!(p2.blocks, p1.blocks, "same tree → same block count");
+    assert_eq!(
+        p2.blocks_uploaded, 0,
+        "canonical packing → all blocks already durable → gate skips every upload"
+    );
+
+    // the manifest still materializes (blocks are present from publish 1)
+    let out = d.path().join("o");
+    materialize(&LocalBlobStore::new(&sdir).unwrap(), &p2.manifest, &out).unwrap();
+    for i in 0..20u32 {
+        assert_eq!(
+            fs::read(out.join(format!("f{i}.bin"))).unwrap(),
+            vec![i as u8; 300_000]
+        );
+    }
+}
+
+// Idea 3 COUPLING: manifest compression + the file-backed GC's decompress (gc.rs) are inseparable. The
+// GC reads manifest bytes DIRECTLY (not via get_manifest), so with compression on it must decompress or it
+// wedges (fail-safe: aborts, deletes nothing — but unbounded growth). This pins that a block referenced by
+// a COMPRESSED manifest survives GC. Reverting the gc.rs decompress makes this fail (mutation-verified).
+#[test]
+fn gc_marks_blocks_of_a_compressed_manifest() {
+    use capsule_workspace_core::daemon::publish;
+    use capsule_workspace_core::gc;
+    let _g = env_guard();
+    std::env::set_var("CAPWS_MANIFEST_ZSTD", "1");
+    let d = tempfile::tempdir().unwrap();
+    let tree = d.path().join("t");
+    for i in 0..10u32 {
+        write(&tree.join(format!("f{i}.bin")), &vec![i as u8; 300_000]);
+    }
+    let root = d.path().join("s");
+    let p = publish(
+        &tree,
+        &LocalBlobStore::new(&root).unwrap(),
+        &ChunkIndex::new(),
+        None,
+    )
+    .unwrap();
+    // the manifest is stored COMPRESSED (this is the state the GC must tolerate)
+    let mbytes = std::fs::read(root.join("manifests").join(&p.manifest)).unwrap();
+    assert_eq!(
+        &mbytes[..4],
+        &[0x28, 0xB5, 0x2F, 0xFD],
+        "manifest must be stored compressed"
+    );
+    // GC with this manifest as the sole live HEAD, grace=0: must MARK (keep) its blocks, delete none.
+    let st = gc::collect(
+        &root,
+        std::slice::from_ref(&p.manifest),
+        std::time::Duration::ZERO,
+    )
+    .unwrap();
+    std::env::remove_var("CAPWS_MANIFEST_ZSTD");
+    assert!(
+        st.blocks_kept > 0,
+        "GC must mark blocks referenced by a COMPRESSED manifest"
+    );
+    assert_eq!(
+        st.blocks_deleted, 0,
+        "GC must not delete a live compressed manifest's blocks"
+    );
+    // and the tree still materializes — the blocks survived.
+    let out = d.path().join("o");
+    materialize(&LocalBlobStore::new(&root).unwrap(), &p.manifest, &out).unwrap();
+    for i in 0..10u32 {
+        assert_eq!(
+            fs::read(out.join(format!("f{i}.bin"))).unwrap(),
+            vec![i as u8; 300_000]
+        );
+    }
+}
+
+// Idea 2 ADAPTIVE decision: a densely-referenced block is fetched WHOLE (one GET), a sparsely-referenced
+// block is fetched by RANGE (per-chunk GETs). Verified by counting each store call — not just byte-identity.
+#[test]
+fn ranged_reads_are_adaptive_dense_whole_sparse_ranged() {
+    use capsule_workspace_core::daemon::publish;
+    use capsule_workspace_core::manifest::Manifest;
+    let _g = env_guard();
+    let d = tempfile::tempdir().unwrap();
+    let sdir = d.path().join("s");
+
+    struct Adaptive {
+        inner: LocalBlobStore,
+        whole: Arc<AtomicUsize>,
+        ranged: Arc<AtomicUsize>,
+    }
+    impl BlobStore for Adaptive {
+        fn put_block(&self, i: &BlockId, b: &[u8]) -> anyhow::Result<()> {
+            self.inner.put_block(i, b)
+        }
+        fn get_block(&self, i: &BlockId) -> anyhow::Result<Vec<u8>> {
+            self.whole.fetch_add(1, Ordering::SeqCst);
+            self.inner.get_block(i)
+        }
+        fn get_block_range(&self, i: &BlockId, o: u64, l: u32) -> anyhow::Result<Vec<u8>> {
+            self.ranged.fetch_add(1, Ordering::SeqCst);
+            self.inner.get_block_range(i, o, l)
+        }
+        fn put_manifest(&self, d: &str, b: &[u8]) -> anyhow::Result<()> {
+            self.inner.put_manifest(d, b)
+        }
+        fn get_manifest(&self, d: &str) -> anyhow::Result<Vec<u8>> {
+            self.inner.get_manifest(d)
+        }
+        fn has_block(&self, i: &BlockId) -> bool {
+            self.inner.has_block(i)
+        }
+        fn delete_block(&self, i: &BlockId) -> anyhow::Result<bool> {
+            self.inner.delete_block(i)
+        }
+        fn delete_manifest(&self, d: &str) -> anyhow::Result<bool> {
+            self.inner.delete_manifest(d)
+        }
+    }
+    let mk = || {
+        let (w, r) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        (
+            Adaptive {
+                inner: LocalBlobStore::new(&sdir).unwrap(),
+                whole: w.clone(),
+                ranged: r.clone(),
+            },
+            w,
+            r,
+        )
+    };
+
+    // 400 files x 300KB -> ~2 densely-packed 64MiB blocks.
+    let tree = d.path().join("t");
+    for i in 0..400u32 {
+        write(
+            &tree.join(format!("f{i:04}.bin")),
+            &vec![(i % 251) as u8; 300_000],
+        );
+    }
+    let full = publish(
+        &tree,
+        &LocalBlobStore::new(&sdir).unwrap(),
+        &ChunkIndex::new(),
+        None,
+    )
+    .unwrap();
+    let mut idx = ChunkIndex::new();
+    idx.extend(
+        Manifest::from_bytes(
+            &LocalBlobStore::new(&sdir)
+                .unwrap()
+                .get_manifest(&full.manifest)
+                .unwrap(),
+        )
+        .unwrap()
+        .chunks,
+    );
+    // sparse tree: 4 of those files, deduped into `full`'s blocks -> M_sparse references ~1% of each block.
+    let sp = d.path().join("sp");
+    for i in [0u32, 100, 200, 300] {
+        write(
+            &sp.join(format!("f{i:04}.bin")),
+            &vec![(i % 251) as u8; 300_000],
+        );
+    }
+    let sparse = publish(&sp, &LocalBlobStore::new(&sdir).unwrap(), &idx, None).unwrap();
+
+    std::env::set_var("CAPWS_RANGED_READS", "1");
+    let (st, w, r) = mk();
+    materialize(&st, &full.manifest, &d.path().join("od")).unwrap();
+    assert!(
+        w.load(Ordering::SeqCst) > 0 && r.load(Ordering::SeqCst) == 0,
+        "DENSE manifest must fetch blocks WHOLE (whole={}, ranged={})",
+        w.load(Ordering::SeqCst),
+        r.load(Ordering::SeqCst)
+    );
+    let (st, w, r) = mk();
+    materialize(&st, &sparse.manifest, &d.path().join("os")).unwrap();
+    assert!(
+        r.load(Ordering::SeqCst) > 0 && w.load(Ordering::SeqCst) == 0,
+        "SPARSE manifest must fetch chunks by RANGE (whole={}, ranged={})",
+        w.load(Ordering::SeqCst),
+        r.load(Ordering::SeqCst)
+    );
+    std::env::remove_var("CAPWS_RANGED_READS");
+}

@@ -56,6 +56,32 @@ fn hex(b: &[u8]) -> String {
     String::from_utf8(out).expect("hex output is ASCII")
 }
 
+/// Manifests are JSON (highly compressible — ~4x) and fetched on EVERY resume/materialize-on-start, so
+/// zstd them at rest. DIGEST-NEUTRAL by construction: a manifest is keyed by `logical_digest` (logical
+/// content), never by its stored bytes, and materialize re-checks the digest on read — so compressing the
+/// stored bytes cannot change identity (the golden digest test passes unchanged). Only MANIFESTS: blocks
+/// are already zstd'd. OPT-IN via `CAPWS_MANIFEST_ZSTD=1` (default OFF, like the other two optimizations) —
+/// it stays off until the AWS A/B proves the win and a gate defaults it on. Applied at the STORE BOUNDARY
+/// (each store compresses-in / decompresses-out), so every store is self-describing. NOTE: a caller that
+/// reads a manifest FILE directly (the file-backed GC; some tests) must `maybe_decompress_manifest` itself
+/// — the accessor decompression only covers `get_manifest`.
+pub fn compress_manifest(bytes: &[u8]) -> Vec<u8> {
+    if std::env::var("CAPWS_MANIFEST_ZSTD").as_deref() == Ok("1") {
+        return zstd::encode_all(bytes, ZSTD_LEVEL).unwrap_or_else(|_| bytes.to_vec());
+    }
+    bytes.to_vec()
+}
+
+/// Inverse of [`compress_manifest`], back-compatible with raw (pre-feature) manifests. The zstd magic is
+/// `0x28 B5 2F FD`; a JSON manifest starts with `{` (0x7B), so the sniff has no false positive.
+pub fn maybe_decompress_manifest(bytes: Vec<u8>) -> Vec<u8> {
+    if bytes.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
+        zstd::decode_all(&bytes[..]).unwrap_or(bytes)
+    } else {
+        bytes
+    }
+}
+
 /// Typed store error so callers distinguish a genuinely-absent object from a transient failure —
 /// GC and crash-retry/republish logic depend on `NotFound` ≠ generic error. Uniform across every
 /// `BlobStore` backend (local fs and S3). Carries only the key, never any secret material.
@@ -77,6 +103,21 @@ impl std::error::Error for StoreError {}
 pub trait BlobStore: Send + Sync {
     fn put_block(&self, id: &BlockId, bytes: &[u8]) -> Result<()>;
     fn get_block(&self, id: &BlockId) -> Result<Vec<u8>>;
+    /// Fetch only `[offset, offset+len)` of a block's stored bytes. Default: whole-block get + slice
+    /// (correct, but no egress win — for wrapper stores). `LocalBlobStore` seeks; `S3BlobStore` issues a
+    /// RANGED GET, which is the win when a manifest references only a sparse slice of a block (refetch
+    /// amplification). Integrity is unchanged: materialize hashes each DECOMPRESSED chunk against its id,
+    /// so a partial fetch is as authenticated as a whole-block one.
+    fn get_block_range(&self, id: &BlockId, offset: u64, len: u32) -> Result<Vec<u8>> {
+        let b = self.get_block(id)?;
+        let (o, l) = (offset as usize, len as usize);
+        b.get(o..o + l).map(<[u8]>::to_vec).ok_or_else(|| {
+            anyhow::anyhow!(
+                "get_block_range: [{offset},+{len}) out of block {id} ({})",
+                b.len()
+            )
+        })
+    }
     fn put_manifest(&self, digest: &str, bytes: &[u8]) -> Result<()>;
     fn get_manifest(&self, digest: &str) -> Result<Vec<u8>>;
     fn has_block(&self, id: &BlockId) -> bool;
@@ -174,6 +215,20 @@ impl BlobStore for LocalBlobStore {
     fn get_block(&self, id: &BlockId) -> Result<Vec<u8>> {
         read_or_notfound(&self.block_path(id), id)
     }
+    fn get_block_range(&self, id: &BlockId, offset: u64, len: u32) -> Result<Vec<u8>> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f = match std::fs::File::open(self.block_path(id)) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(StoreError::NotFound(id.clone()).into());
+            }
+            Err(e) => return Err(e.into()),
+        };
+        f.seek(SeekFrom::Start(offset))?;
+        let mut buf = vec![0u8; len as usize];
+        f.read_exact(&mut buf)?;
+        Ok(buf)
+    }
     fn put_manifest(&self, digest: &str, bytes: &[u8]) -> Result<()> {
         // atomic write-then-rename with a per-writer UNIQUE temp (same fix as put_block): two
         // writers committing the SAME content-addressed digest concurrently (two lineages with
@@ -189,7 +244,7 @@ impl BlobStore for LocalBlobStore {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let tmp = p.with_extension(format!("{}.{}.tmp", std::process::id(), n));
-        std::fs::write(&tmp, bytes)?;
+        std::fs::write(&tmp, compress_manifest(bytes))?; // zstd at rest (digest-neutral)
         if std::fs::rename(&tmp, &p).is_err() {
             let _ = std::fs::remove_file(&tmp);
             if !p.exists() {
@@ -199,7 +254,7 @@ impl BlobStore for LocalBlobStore {
         Ok(())
     }
     fn get_manifest(&self, digest: &str) -> Result<Vec<u8>> {
-        read_or_notfound(&self.manifest_path(digest), digest)
+        read_or_notfound(&self.manifest_path(digest), digest).map(maybe_decompress_manifest)
     }
     fn has_block(&self, id: &BlockId) -> bool {
         self.block_path(id).exists()

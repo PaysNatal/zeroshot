@@ -54,6 +54,11 @@ pub struct PublishStats {
     pub upload_mb: f64,
     pub zstd_ratio_on_new: f64,
     pub blocks: usize,
+    /// Blocks actually PUT to the store this publish. Equals `blocks` normally; LOWER when the Idea-1
+    /// cross-capsule dedup gate (`CAPWS_DEDUP_GATE=1`) skipped a block already durable from another
+    /// capsule/run. `blocks - blocks_uploaded` is the cross-capsule dedup win — the measurement signal.
+    #[serde(default)]
+    pub blocks_uploaded: usize,
     pub symlinks: usize,
     pub skipped_special: usize,
     pub read_hash_secs: f64,
@@ -165,6 +170,19 @@ fn walk_entries(root: &Path) -> Result<(Vec<PathBuf>, Vec<FileEntry>, usize)> {
 
 /// Publish a tree. `known` is the chunk index already durable (the dedup set the real
 /// daemon consults from the lineage). Returns the new manifest digest + stats.
+/// Idea 1 — cross-capsule dedup gate (`CAPWS_DEDUP_GATE=1`): should this block's upload be SKIPPED because
+/// it is already durable in the store (another capsule/run put it)? Content-addressed, so a `has_block` hit
+/// is byte-identical; the block is still referenced in this publish's manifest either way.
+///
+/// EFFECTIVE ONLY WITH CANONICAL (deterministic) PACKING. The streaming path packs in `files.sort()` order
+/// and is canonical → two runs of the same content produce the SAME block ids → the gate hits. The pipelined
+/// path packs in parallel-arrival order → block ids differ across runs → the gate misses. That dependency is
+/// the thing the AWS A/B measures, not assumes. Behind a flag because on a FIRST publish every HEAD misses,
+/// so a serial HEAD-per-block would add pure latency; parallelism at the call site is the caller's job.
+fn dedup_skip_upload(store: &dyn BlobStore, bid: &BlockId) -> bool {
+    std::env::var("CAPWS_DEDUP_GATE").as_deref() == Ok("1") && store.has_block(bid)
+}
+
 pub fn publish(
     root: &Path,
     store: &dyn BlobStore,
@@ -197,9 +215,11 @@ pub fn publish(
     let mut upload_secs = 0f64;
     let mut buf = vec![0u8; CHUNK];
 
+    let mut blocks_uploaded = 0usize;
     let flush = |cur: &mut BlockBuilder,
                  new_index: &mut ChunkIndex,
                  n_blocks: &mut usize,
+                 blocks_uploaded: &mut usize,
                  upload_secs: &mut f64|
      -> Result<()> {
         if cur.buf.is_empty() {
@@ -220,7 +240,10 @@ pub fn publish(
             );
         }
         let tu = Instant::now();
-        store.put_block(&bid, &bytes)?;
+        if !dedup_skip_upload(store, &bid) {
+            store.put_block(&bid, &bytes)?;
+            *blocks_uploaded += 1;
+        }
         *upload_secs += tu.elapsed().as_secs_f64();
         *n_blocks += 1;
         Ok(())
@@ -262,7 +285,13 @@ pub fn publish(
             new_raw_bytes += filled as u64;
             comp_new += comp.len() as u64;
             if cur.buf.len() >= BLOCK_TARGET {
-                flush(&mut cur, &mut new_index, &mut n_blocks, &mut upload_secs)?;
+                flush(
+                    &mut cur,
+                    &mut new_index,
+                    &mut n_blocks,
+                    &mut blocks_uploaded,
+                    &mut upload_secs,
+                )?;
             }
             if filled < CHUNK {
                 break; // short final chunk
@@ -277,7 +306,13 @@ pub fn publish(
             hardlink: None,
         });
     }
-    flush(&mut cur, &mut new_index, &mut n_blocks, &mut upload_secs)?;
+    flush(
+        &mut cur,
+        &mut new_index,
+        &mut n_blocks,
+        &mut blocks_uploaded,
+        &mut upload_secs,
+    )?;
     let stream_secs = t_stream.elapsed().as_secs_f64();
     let read_hash_secs = stream_secs;
     let compress_secs = stream_secs;
@@ -325,6 +360,7 @@ pub fn publish(
         upload_mb: comp_new as f64 / 1e6,
         zstd_ratio_on_new: new_raw_bytes as f64 / comp_new.max(1) as f64,
         blocks: n_blocks,
+        blocks_uploaded,
         symlinks: n_symlinks,
         skipped_special,
         read_hash_secs,
@@ -393,6 +429,7 @@ pub fn publish_pipelined(
     let mut new_chunks = 0usize;
     let mut new_raw_bytes = 0u64;
 
+    let uploaded = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)); // Idea-1 dedup counter
     let (new_index, n_blocks, comp_new) = std::thread::scope(|scope| -> Result<_> {
         let (comp_tx, comp_rx) = sync_channel::<(ChunkId, Vec<u8>, u32)>(cap.max(1) * workers);
         let mut raw_txs = Vec::with_capacity(workers);
@@ -422,9 +459,15 @@ pub fn publish_pipelined(
             // block-tier peak to ~2·workers blocks (queued + in-flight) instead of `cap`·workers.
             let (utx, urx) = sync_channel::<(BlockId, Vec<u8>)>(1);
             up_txs.push(utx);
+            let uploaded = uploaded.clone();
             uhandles.push(scope.spawn(move || -> Result<()> {
                 while let Ok((bid, bytes)) = urx.recv() {
-                    store.put_block(&bid, &bytes)?;
+                    // Idea-1 gate: the HEAD runs on THIS uploader thread, so the checks are parallel
+                    // across `workers` (not a serial pre-pass), per the review note.
+                    if !dedup_skip_upload(store, &bid) {
+                        store.put_block(&bid, &bytes)?;
+                        uploaded.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
                 Ok(())
             }));
@@ -616,6 +659,7 @@ pub fn publish_pipelined(
         upload_mb: comp_new as f64 / 1e6,
         zstd_ratio_on_new: new_raw_bytes as f64 / comp_new.max(1) as f64,
         blocks: n_blocks,
+        blocks_uploaded: uploaded.load(std::sync::atomic::Ordering::Relaxed),
         symlinks: n_symlinks,
         skipped_special,
         read_hash_secs: wall,
@@ -734,6 +778,18 @@ const _: () = assert!(
     "a materialize wave holds ~2x this in logical bytes plus a compressed batch; on small pods that \
      scales peak RSS directly, so raising it is a deliberate operational decision, not a tweak"
 );
+
+/// Idea 2 adaptive-reads coverage threshold: fetch a block WHOLE if the wave references at least this
+/// fraction of its bytes, else fetch its referenced chunks by RANGE. Below the crossover, ranged's saved
+/// egress beats the extra per-request latency; above it, one big GET beats many small ones. Measured on
+/// real S3 only at the EXTREMES (coverage ~0 → ranged ~15x faster; coverage 1.0 → ranged ~4.5x SLOWER); the
+/// precise crossover was NOT measured, so this is a CONSERVATIVE heuristic from the cost model (K referenced
+/// chunks cost ~K parallel small GETs vs one whole-block GET) that errs toward whole-block. Only consulted
+/// under `CAPWS_RANGED_READS=1`; the default path is whole-block always, so this can never regress it.
+/// FOLLOW-UP: the true crossover is unmeasured, and coverage-FRACTION is an imperfect proxy — a small block
+/// referenced by many tiny chunks can sit below 0.30 yet still lose to many small GETs (the cost tracks
+/// request COUNT, not just byte fraction). Measure the crossover (and consider a K-cap) on the next S3 run.
+const RANGE_COVERAGE_THRESHOLD: f64 = 0.30;
 
 /// Compressed bytes a wave may hold at once. THIS is the memory bound.
 ///
@@ -996,23 +1052,92 @@ fn write_regular_files(
         // and that is what MATERIALIZE_WAVE_BYTES bounds.
         let need_v: Vec<&BlockId> = need.iter().copied().collect();
         let mut chunks: HashMap<ChunkId, Vec<u8>> = HashMap::with_capacity(cids.len());
-        for batch in group_blocks_by_bytes(&need_v, &block_clen) {
-            let batch = &batch[..];
+        // ADAPTIVE reads (Idea 2, `CAPWS_RANGED_READS=1`): fetch each block WHOLE if the wave references a
+        // dense fraction of it, else fetch only the referenced chunks' `[offset,+clen)` ranges. Measured on
+        // real S3: ranged is ~15x faster on a sparsely-referenced block (the refetch-amplification win) but
+        // ~4.5x SLOWER when a block is densely referenced (one big GET beats hundreds of small ones), so a
+        // blind always-range REGRESSES the common case — hence per-block adaptive. Integrity is identical:
+        // every decompressed chunk is hashed against its id on BOTH paths. Default off = whole-block always.
+        if std::env::var("CAPWS_RANGED_READS").as_deref() == Ok("1") {
+            let mut by_block: HashMap<&BlockId, Vec<&ChunkId>> = HashMap::new();
+            for c in &cids {
+                by_block
+                    .entry(&manifest.chunks[*c].block)
+                    .or_default()
+                    .push(c);
+            }
+            let mut whole: Vec<&BlockId> = Vec::new();
+            let mut sparse: Vec<&ChunkId> = Vec::new();
+            for (blk, cs) in &by_block {
+                let refbytes: u64 = cs.iter().map(|c| manifest.chunks[*c].clen as u64).sum();
+                let blen = block_clen
+                    .get(blk)
+                    .copied()
+                    .unwrap_or(BLOCK_TARGET as u64)
+                    .max(1);
+                if refbytes as f64 >= RANGE_COVERAGE_THRESHOLD * blen as f64 {
+                    whole.push(blk);
+                } else {
+                    sparse.extend(cs.iter().copied());
+                }
+            }
+            // sparse blocks: one RANGED GET per referenced chunk
             let t = Instant::now();
-            let held: HashMap<&BlockId, Vec<u8>> = batch
+            let ranged = sparse
                 .par_iter()
-                .map(|b| -> Result<_> { Ok((*b, store.get_block(b)?)) })
+                .map(|cid| -> Result<(ChunkId, Vec<u8>)> {
+                    let loc = &manifest.chunks[*cid];
+                    let comp = store.get_block_range(&loc.block, loc.offset, loc.clen)?;
+                    let raw = decompress_bounded_hint(&comp, CHUNK, loc.rlen as usize)?;
+                    if raw.len() != loc.rlen as usize {
+                        anyhow::bail!("chunk rlen mismatch (corruption)");
+                    }
+                    if hex_sha256(&raw) != **cid {
+                        anyhow::bail!("chunk hash != id (corruption/tamper)");
+                    }
+                    Ok(((*cid).clone(), raw))
+                })
                 .collect::<Result<HashMap<_, _>>>()?;
             fetch_secs += t.elapsed().as_secs_f64();
-            let resident: HashMap<&BlockId, &Vec<u8>> = held.iter().map(|(b, v)| (*b, v)).collect();
-            let mine: Vec<&ChunkId> = cids
-                .iter()
-                .copied()
-                .filter(|c| resident.contains_key(&manifest.chunks[*c].block))
-                .collect();
-            let t = Instant::now();
-            chunks.extend(verify(&mine, &resident)?);
-            decompress_secs += t.elapsed().as_secs_f64();
+            chunks.extend(ranged);
+            // dense blocks: WHOLE-block fetch (bounded batches), then extract their chunks
+            for batch in group_blocks_by_bytes(&whole, &block_clen) {
+                let batch = &batch[..];
+                let t = Instant::now();
+                let held: HashMap<&BlockId, Vec<u8>> = batch
+                    .par_iter()
+                    .map(|b| -> Result<_> { Ok((*b, store.get_block(b)?)) })
+                    .collect::<Result<HashMap<_, _>>>()?;
+                fetch_secs += t.elapsed().as_secs_f64();
+                let resident: HashMap<&BlockId, &Vec<u8>> =
+                    held.iter().map(|(b, v)| (*b, v)).collect();
+                let mine: Vec<&ChunkId> = cids
+                    .iter()
+                    .copied()
+                    .filter(|c| resident.contains_key(&manifest.chunks[*c].block))
+                    .collect();
+                chunks.extend(verify(&mine, &resident)?);
+            }
+        } else {
+            for batch in group_blocks_by_bytes(&need_v, &block_clen) {
+                let batch = &batch[..];
+                let t = Instant::now();
+                let held: HashMap<&BlockId, Vec<u8>> = batch
+                    .par_iter()
+                    .map(|b| -> Result<_> { Ok((*b, store.get_block(b)?)) })
+                    .collect::<Result<HashMap<_, _>>>()?;
+                fetch_secs += t.elapsed().as_secs_f64();
+                let resident: HashMap<&BlockId, &Vec<u8>> =
+                    held.iter().map(|(b, v)| (*b, v)).collect();
+                let mine: Vec<&ChunkId> = cids
+                    .iter()
+                    .copied()
+                    .filter(|c| resident.contains_key(&manifest.chunks[*c].block))
+                    .collect();
+                let t = Instant::now();
+                chunks.extend(verify(&mine, &resident)?);
+                decompress_secs += t.elapsed().as_secs_f64();
+            }
         }
 
         let t = Instant::now();

@@ -93,7 +93,9 @@ pub fn collect(store_root: &Path, live: &[String], grace: Duration) -> Result<Gc
             }
             Err(e) => return Err(e.into()),
         };
-        let m = Manifest::from_bytes(&mbytes)?;
+        // This file-backed collector reads the manifest bytes DIRECTLY (not via the decompressing
+        // `get_manifest`), so it must undo the at-rest zstd itself; back-compatible with raw manifests.
+        let m = Manifest::from_bytes(&crate::cas::maybe_decompress_manifest(mbytes))?;
         for f in &m.files {
             for cid in &f.chunks {
                 if let Some(loc) = m.chunks.get(cid) {

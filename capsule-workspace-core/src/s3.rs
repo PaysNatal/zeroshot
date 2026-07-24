@@ -148,6 +148,40 @@ impl S3BlobStore {
         })
     }
 
+    /// Ranged GET of `[offset, offset+len)` via the `Range` header — S3 fetches (and charges egress for)
+    /// only those bytes, which is the win for a sparsely-referenced block. Same NotFound classification as
+    /// `get`.
+    fn get_range(&self, key: String, offset: u64, len: u32, ctx: &str) -> Result<Vec<u8>> {
+        let range = format!("bytes={}-{}", offset, offset + len as u64 - 1);
+        self.on(async {
+            let out = match self
+                .client
+                .get_object()
+                .bucket(&self.bucket)
+                .key(&key)
+                .range(range)
+                .send()
+                .await
+            {
+                Ok(o) => o,
+                Err(e) => {
+                    if let SdkError::ServiceError(se) = &e {
+                        if se.err().is_no_such_key() {
+                            return Err(StoreError::NotFound(key).into());
+                        }
+                    }
+                    return Err(redacted(ctx, &e));
+                }
+            };
+            let data = out
+                .body
+                .collect()
+                .await
+                .map_err(|e| anyhow!("{ctx}: body read failed: {e}"))?;
+            Ok(data.into_bytes().to_vec())
+        })
+    }
+
     /// HEAD → `Ok(true)` exists, `Ok(false)` a modeled 404, `Err` a TRANSIENT failure. Async (avoids a
     /// nested `block_on`); callers drive it via `self.on(...)`.
     async fn head_exists(&self, key: &str) -> Result<bool> {
@@ -206,11 +240,20 @@ impl BlobStore for S3BlobStore {
     fn get_block(&self, id: &BlockId) -> Result<Vec<u8>> {
         self.get(block_key(id), "get_block")
     }
+    fn get_block_range(&self, id: &BlockId, offset: u64, len: u32) -> Result<Vec<u8>> {
+        self.get_range(block_key(id), offset, len, "get_block_range")
+    }
     fn put_manifest(&self, digest: &str, bytes: &[u8]) -> Result<()> {
-        self.put(manifest_key(digest), bytes, "put_manifest")
+        // zstd at rest (digest-neutral): the object stays keyed by `digest`, only the stored bytes shrink.
+        self.put(
+            manifest_key(digest),
+            &crate::cas::compress_manifest(bytes),
+            "put_manifest",
+        )
     }
     fn get_manifest(&self, digest: &str) -> Result<Vec<u8>> {
         self.get(manifest_key(digest), "get_manifest")
+            .map(crate::cas::maybe_decompress_manifest)
     }
     fn has_block(&self, id: &BlockId) -> bool {
         self.exists(&block_key(id))
