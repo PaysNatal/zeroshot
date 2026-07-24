@@ -1,0 +1,47 @@
+# KIND ACCEPTANCE-TEST manifest — NOT a production template. `--max-gb 0.05` and `--interval-secs 3` are
+# tiny test values (a real node cache is GBs); the cross-UID gid-3000 setup exercises the FALLBACK path.
+# Production default is single-uid cache I/O via the trusted capsule-agent (no shared gid needed) — see
+# deploy/README.md. Pin the ceiling before adapting this anywhere real.
+#
+# The node-plane cache agent, one per node (DaemonSet), sole sweeper of the shared hostPath cache.
+# hostPath /var/cache/capsule-ws is the node-local cache dir every capsule pod on this node shares.
+# The agent OWNS the dir (runs as root here, explicitly) so its eviction can remove any pod's block.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata: { name: cache-agent, namespace: nodeplane }
+spec:
+  selector: { matchLabels: { app: cache-agent } }
+  template:
+    metadata: { labels: { app: cache-agent } }
+    spec:
+      # Explicit root: the initContainer's chgrp/chmod and the agent's cross-uid eviction both need it —
+      # don't rely on the image's default user.
+      securityContext:
+        runAsUser: 0
+      # The agent OWNS the shared cache dir. An init step (root) establishes it group-writable with a
+      # shared gid (3000) + setgid, so cross-UID capsule pods that join gid 3000 can write to it and their
+      # files inherit the gid. fsGroup does NOT work on hostPath (kubelet only manages ownership for
+      # volume plugins that declare support), so this is the mechanism: setgid dir + supplementalGroups.
+      initContainers:
+        - name: setup-perms
+          image: capsule-ws:layer1
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - "mkdir -p /cache/blocks /cache/manifests && chgrp -R 3000 /cache && chmod 2775 /cache /cache/blocks /cache/manifests"
+          volumeMounts:
+            - { name: cache, mountPath: /cache }
+      containers:
+        - name: agent
+          image: capsule-ws:layer1
+          imagePullPolicy: IfNotPresent
+          command: ["capsule-workspace", "cache-agent"]
+          args: ["--cache-dir", "/cache", "--max-gb", "0.05", "--interval-secs", "3"]
+          volumeMounts:
+            - { name: cache, mountPath: /cache }
+      volumes:
+        # hostPath = genuinely per-node (each kind worker is its own container). A pod on worker-1 and a
+        # pod on worker-2 get DIFFERENT caches — the property a single-node cluster would hide.
+        - name: cache
+          hostPath: { path: /var/cache/capsule-ws, type: DirectoryOrCreate }

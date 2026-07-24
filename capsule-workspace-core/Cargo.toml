@@ -31,6 +31,10 @@ anyhow = "1"
 # file-level reflink (CoW clone) for warm INCREMENTAL resume: FICLONE on XFS, clonefile on APFS,
 # transparent full-copy fallback on filesystems without reflink. O(1) reuse of unchanged files.
 reflink-copy = "0.1"
+# For utimensat(times=NULL): refresh atime+mtime to NOW with only WRITE permission (not the OWNERSHIP that
+# std's set_modified requires), so a DIFFERENT uid can refresh a group-writable shared cache block on read
+# — the cross-UID read-recency LRU. Verified necessary in a kind cluster (set_modified EPERMs cross-UID).
+libc = "0.2"
 clap = { version = "4", features = ["derive"] }
 
 # optional real S3 backend (drop-in for the node daemon); not needed for CPU-rate measurement.

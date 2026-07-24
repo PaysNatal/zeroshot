@@ -1,0 +1,29 @@
+# In-cluster S3 (durable backing). Correctness-faithful, not latency-faithful — that's the kind/EKS split.
+apiVersion: v1
+kind: Namespace
+metadata: { name: nodeplane }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: minio, namespace: nodeplane }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: minio } }
+  template:
+    metadata: { labels: { app: minio } }
+    spec:
+      containers:
+        - name: minio
+          image: minio/minio:latest
+          args: ["server", "/data", "--console-address", ":9001"]
+          env:
+            - { name: MINIO_ROOT_USER, value: minioadmin }
+            - { name: MINIO_ROOT_PASSWORD, value: minioadmin }
+          ports: [{ containerPort: 9000 }, { containerPort: 9001 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: minio, namespace: nodeplane }
+spec:
+  selector: { app: minio }
+  ports: [{ name: s3, port: 9000, targetPort: 9000 }]

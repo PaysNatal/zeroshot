@@ -129,6 +129,30 @@ enum Cmd {
         #[arg(long, default_value_t = 3600)]
         grace_secs: u64,
     },
+    /// Node-plane cache PROBE (Layer 1 acceptance harness): put/get one block through a pod-shaped cache
+    /// (`for_pod`: never sweeps) over a durable backing, reporting whether a read was served by the shared
+    /// node cache (HIT) or fell through to the backing (MISS). Lets the kind acceptance tests assert
+    /// cross-UID reads, per-node scoping, and the backstop from real multi-pod pods.
+    CacheProbe {
+        /// Shared node-local cache dir (a hostPath).
+        #[arg(long)]
+        cache_dir: String,
+        /// Durable backing: `file://<path>` or `s3://<bucket>` (endpoint/creds via env).
+        #[arg(long)]
+        store: String,
+        /// `put` writes a deterministic block; `get` reads it and prints HIT/MISS/NOTFOUND.
+        #[arg(long)]
+        op: String,
+        /// Block id (64 hex chars conventionally; any string works as a key).
+        #[arg(long)]
+        id: String,
+        /// `put` payload size in KiB (deterministic bytes derived from `id`).
+        #[arg(long, default_value_t = 256)]
+        size_kib: usize,
+        /// Optional pod device-fill backstop, in MiB (skips cache writes over this).
+        #[arg(long)]
+        backstop_mb: Option<u64>,
+    },
     /// Node-plane cache agent: the SOLE sweeper of a shared node-local cache dir (a DaemonSet hostPath
     /// that many capsule pods read/write). Pods use the cache with NO ceiling and never sweep; this agent
     /// owns the dir and periodically evicts it under the byte ceiling. Runs one per node.
@@ -323,11 +347,135 @@ fn main() -> Result<()> {
                 );
             }
         }
+        Cmd::CacheProbe {
+            cache_dir,
+            store,
+            op,
+            id,
+            size_kib,
+            backstop_mb,
+        } => run_cache_probe(&cache_dir, &store, &op, &id, size_kib, backstop_mb)?,
         Cmd::CacheAgent {
             cache_dir,
             max_gb,
             interval_secs,
         } => run_cache_agent(&cache_dir, max_gb, interval_secs)?,
+    }
+    Ok(())
+}
+
+/// Build a durable backing (no cache tier) from a `--store` URI. `file://` always; `s3://` under feature.
+fn build_backing(uri: &str) -> Result<Box<dyn capsule_workspace_core::cas::BlobStore>> {
+    if let Some(path) = uri.strip_prefix("file://") {
+        Ok(Box::new(LocalBlobStore::new(path)?))
+    } else if let Some(_bucket) = uri.strip_prefix("s3://") {
+        #[cfg(feature = "s3")]
+        {
+            let endpoint = std::env::var("S3_ENDPOINT_URL")
+                .ok()
+                .filter(|s| !s.is_empty());
+            Ok(Box::new(capsule_workspace_core::s3::S3BlobStore::new(
+                _bucket, endpoint,
+            )?))
+        }
+        #[cfg(not(feature = "s3"))]
+        anyhow::bail!("an s3:// store requires the `s3` feature — rebuild with --features s3")
+    } else {
+        anyhow::bail!("unrecognized --store {uri:?}: expected file://<path> or s3://<bucket>")
+    }
+}
+
+/// Layer 1 acceptance probe: put/get one block through a POD-shaped cache and report HIT vs MISS.
+fn run_cache_probe(
+    cache_dir: &str,
+    store: &str,
+    op: &str,
+    id: &str,
+    size_kib: usize,
+    backstop_mb: Option<u64>,
+) -> Result<()> {
+    use capsule_workspace_core::cache::CachedBlobStore;
+    use capsule_workspace_core::cas::{BlobStore, BlockId};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    // Deterministic payload from the id, so put and get agree without shared state.
+    let payload = |n: usize| -> Vec<u8> {
+        let seed = id
+            .bytes()
+            .fold(0u64, |a, b| a.wrapping_mul(131).wrapping_add(b as u64));
+        (0..n)
+            .map(|i| (seed.wrapping_add(i as u64) & 0xff) as u8)
+            .collect()
+    };
+
+    // Count get_blocks that reach the BACKING — a get served with zero backing gets is a cache HIT.
+    struct Counting {
+        inner: Box<dyn BlobStore>,
+        backing_gets: Arc<AtomicU64>,
+    }
+    impl BlobStore for Counting {
+        fn put_block(&self, i: &BlockId, b: &[u8]) -> Result<()> {
+            self.inner.put_block(i, b)
+        }
+        fn get_block(&self, i: &BlockId) -> Result<Vec<u8>> {
+            self.backing_gets.fetch_add(1, Ordering::SeqCst);
+            self.inner.get_block(i)
+        }
+        fn put_manifest(&self, d: &str, b: &[u8]) -> Result<()> {
+            self.inner.put_manifest(d, b)
+        }
+        fn get_manifest(&self, d: &str) -> Result<Vec<u8>> {
+            self.inner.get_manifest(d)
+        }
+        fn has_block(&self, i: &BlockId) -> bool {
+            self.inner.has_block(i)
+        }
+        fn delete_block(&self, i: &BlockId) -> Result<bool> {
+            self.inner.delete_block(i)
+        }
+        fn delete_manifest(&self, d: &str) -> Result<bool> {
+            self.inner.delete_manifest(d)
+        }
+    }
+
+    let backing_gets = Arc::new(AtomicU64::new(0));
+    let counting = Counting {
+        inner: build_backing(store)?,
+        backing_gets: Arc::clone(&backing_gets),
+    };
+    let backstop = backstop_mb.map(|m| m * 1024 * 1024);
+    let cache = CachedBlobStore::for_pod(cache_dir, Box::new(counting), backstop)?;
+
+    match op {
+        "put" => {
+            cache.put_block(&id.to_string(), &payload(size_kib * 1024))?;
+            println!("PUT ok id={id} size_kib={size_kib}");
+        }
+        "get" => match cache.get_block(&id.to_string()) {
+            Ok(b) => {
+                let hit = backing_gets.load(Ordering::SeqCst) == 0;
+                let correct = b == payload(size_kib * 1024);
+                println!(
+                    "GET {} id={id} len={} correct={correct}",
+                    if hit { "HIT" } else { "MISS" },
+                    b.len()
+                );
+                if !correct {
+                    anyhow::bail!("GET returned wrong bytes for {id}");
+                }
+            }
+            Err(e)
+                if matches!(
+                    e.downcast_ref::<capsule_workspace_core::cas::StoreError>(),
+                    Some(capsule_workspace_core::cas::StoreError::NotFound(_))
+                ) =>
+            {
+                println!("GET NOTFOUND id={id}")
+            }
+            Err(e) => return Err(e),
+        },
+        _ => anyhow::bail!("--op must be put or get"),
     }
     Ok(())
 }

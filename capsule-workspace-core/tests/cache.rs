@@ -345,3 +345,29 @@ fn the_pod_backstop_caps_cache_growth() {
         );
     }
 }
+
+// touch_block must refresh a cached block's mtime — the read-recency mechanism, exercised directly. (The
+// CROSS-UID property that motivated the utimensat(NULL) switch can only be pinned in a real cluster with a
+// second uid; the kind acceptance suite does that. This pins the same-process behaviour as a fast guard.)
+#[test]
+fn touch_block_refreshes_mtime() {
+    let d = tempfile::tempdir().unwrap();
+    let cache_root = d.path().join("c");
+    let s = LocalBlobStore::new(&cache_root).unwrap();
+    let id = "e".repeat(64);
+    s.put_block(&id, &vec![7u8; 4096]).unwrap();
+    set_mtime_secs_ago(&block_file(&cache_root, &id), 500);
+    let old = std::fs::metadata(block_file(&cache_root, &id))
+        .unwrap()
+        .modified()
+        .unwrap();
+    s.touch_block(&id).unwrap();
+    let new = std::fs::metadata(block_file(&cache_root, &id))
+        .unwrap()
+        .modified()
+        .unwrap();
+    assert!(
+        new > old,
+        "touch_block must move mtime forward ({old:?} -> {new:?})"
+    );
+}

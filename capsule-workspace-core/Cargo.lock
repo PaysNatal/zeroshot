@@ -585,6 +585,7 @@ dependencies = [
  "aws-sdk-s3",
  "clap",
  "fastcdc",
+ "libc",
  "rayon",
  "reflink-copy",
  "serde",

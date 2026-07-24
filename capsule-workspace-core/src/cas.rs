@@ -128,10 +128,21 @@ impl LocalBlobStore {
 /// corruption; reproduced by the reviewer). Touch-on-reference restores the invariant. (Prod
 /// replaces mtime with a monotonic Postgres commit timestamp refreshed on EVERY reference.)
 fn touch_mtime(p: &Path) -> Result<()> {
-    std::fs::File::options()
-        .write(true)
-        .open(p)?
-        .set_modified(std::time::SystemTime::now())?;
+    // `utimensat(times = NULL)` sets BOTH atime+mtime to the current time and — unlike `set_modified`,
+    // which writes an EXPLICIT mtime and therefore requires file OWNERSHIP — needs only WRITE permission.
+    // That distinction is load-bearing for the cross-UID read-recency LRU: a pod at a DIFFERENT uid must
+    // be able to refresh a group-writable (0664) shared cache block on read. Verified in a kind cluster:
+    // `set_modified`/`touch -m` (explicit mtime) EPERM cross-UID even with group-write; this path succeeds.
+    // Only each cached FILE's `mtime` feeds GC's liveness clock and the cache LRU (`evict_to_limit`
+    // sorts by `m.modified()`), so also updating `atime` here is harmless — nothing reads it.
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(p.as_os_str().as_bytes())?;
+    // SAFETY: `c` is a valid NUL-terminated path for the duration of the call; a NULL `times` is the
+    // documented "set both to now" form of utimensat.
+    let rc = unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), std::ptr::null(), 0) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
     Ok(())
 }
 
